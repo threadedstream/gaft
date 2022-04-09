@@ -3,6 +3,7 @@ package main
 import (
 	"math/rand"
 	"time"
+	"fmt"
 )
 
 type state int
@@ -20,6 +21,8 @@ type LogEntry struct {
 
 type Server struct {
 	state
+	// server's id 
+	id int
 	// latest term server has seen (initialized to 0 on first boot, increases monotonically)
 	currentTerm int
 	// latest term server has seen (initialized to 0 on first boot, increases monotonically)
@@ -35,12 +38,16 @@ type Server struct {
 	nextIndex  []int
 	matchIndex []int
 
-	electionDuration time.Duration
+	electionTimeout time.Duration
+	electionResetEvent time.Time
 }
 
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictTerm int
+	ConflictIndex int
 }
 
 type AppendEntriesArguments struct {
@@ -64,26 +71,67 @@ func NewServer() *Server {
 	return server
 }
 
+func (s *Server) stringState() string{
+	switch s.state {
+	case Leader:
+		return "leader"
+	case Follower:
+		return "follower"
+	case Candidate:
+		return "candidate"
+	default:
+		return "undetermined"
+	}
+}
+
+func (s *Server) log(format string, args ... any) {
+	currState := s.stringState()
+	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.id, format)
+	fmt.Printf(extendedFmt, args)
+}
+
+func min(x, y int) int {
+	if x < y {
+		return x
+	} else {
+		return y
+	}
+}
+
 func (s *Server) monitorElectionTimer() {
-	s.electionDuration = time.Duration(150 * rand.Intn(3)) * time.Millisecond
+	timeoutDuration := randomizedElectionTimeout()
+	termStarted := s.currentTerm
 
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
 	for {
-		<-ticker.C
+		time.Sleep(10 * time.Millisecond)
+	
+		if s.state != Follower && s.state != Candidate {
+			s.log("neither follower nor candidate")
+			return
+		}
 
-		select {
-		case <-time.After(s.electionDuration):
+		if termStarted != s.currentTerm {
+			s.log("termStarted does not match a current term")
+			return
+		}
+
+		if elapsed := time.Since(s.electionResetEvent); elapsed >= timeoutDuration {
+			s.log("timed out, about to start an election")
 			s.startElection()
-		default:
-			continue
+			return
 		}
 	}
 }
 
+func randomizedElectionTimeout() time.Duration {
+	if rand.Intn(5) == 2 {
+		return time.Duration(150) * time.Millisecond
+	}
+	return time.Duration(300) * time.Millisecond
+}
+
 func (s *Server) startElection() {
 
-	s.resetElectionDuration()
 }
 
 // AppendEntries RPC
@@ -103,15 +151,15 @@ func (s *Server) startElection() {
 // 3. If an existing entry conflicts with a new one (same index
 // but different terms), delete the existing entry and all that
 // follow it (§5.3)
-// 4. Append any new entries not already in the log
 // 5. If leaderCommit > commitIndex, set commitIndex =
+// 4. Append any new entries not already in the log
 // min(leaderCommit, index of last new entry)
 
 func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntriesReply) error {
 	result.Success = false
 
 	if s.currentTerm < args.Term {
-		s.fallIntoFollowerState()
+		s.transitionToFollower(args.Term)
 	}
 
 	if s.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -141,13 +189,37 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 		if newEntriesIdx < len(args.Entries) {
 			s.logEntries = append(s.logEntries[:logInsertIdx], args.Entries[newEntriesIdx:]...)
 		}
+		
+		if args.LeaderCommit > s.commitIndex {
+			s.commitIndex = min(args.LeaderCommit, len(s.logEntries) - 1)
+		}
+	} else {
+		if args.PrevLogIndex >= len(s.logEntries) {
+			result.ConflictIndex = len(s.logEntries)
+			result.ConflictTerm = -1
+		} else {
+			result.ConflictTerm = s.logEntries[s.PrevLogIndex].Term
+			var i int
+			for i = s.PrevLogIndex - 1; i >= 0; i-- {
+				if s.logEntries[i].Term != result.ConflictTerm {
+					break
+				}
+			}
+			result.ConflictIndex = i + 1
+		}
 	}
 
 	return nil
 }
 
-func (s *Server) fallIntoFollowerState() {
-	s.
+func (s *Server) transitionToFollower(term int) {
+	s.log("become a follower with term %d", term)
+	s.state = Follower
+	s.votedFor = -1
+	s.currentTerm = term
+	s.electionResetEvent = time.Now()
+
+	go monitorElectionTimer()
 }
 
 // RequestVote RPC
@@ -163,10 +235,6 @@ func (s *Server) fallIntoFollowerState() {
 // 1. Reply false if term < currentTerm (§5.1)
 // 2. If votedFor is null or candidateId, and candidate’s log is at
 // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-
-func initializeServers() {
-
-}
 
 func main() {
 
