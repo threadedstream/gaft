@@ -1,13 +1,25 @@
-package main
+package raft
 
 import (
+	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/rpc"
 	"sync"
-	"math/rand"
 	"time"
-	"fmt"
+)
+
+const (
+	rpcBase               = "Gaft"
+	appendEntriesEndpoint = "Gaft.AppendEntries"
+	requestVoteEndpoint   = "Gaft.RequestVote"
+)
+
+const (
+	rpcCallTimeout = time.Second * 15
+	// maximum number of attempts to reach out a client
+	maxCallAttempts = 3
 )
 
 // arguments and replies for rpc calls
@@ -23,9 +35,9 @@ type (
 
 	AppendEntriesReply struct {
 		Term          int
+		Success       bool
 		ConflictTerm  int
 		ConflictIndex int
-		Success       bool
 	}
 
 	RequestVoteArguments struct {
@@ -55,8 +67,13 @@ type LogEntry struct {
 	Command any
 }
 
+type Printable interface {
+	String() string
+}
+
 // Server represents a single unit in cluster of servers
 type Server struct {
+	Printable
 	state
 	// server's id
 	id int
@@ -106,10 +123,19 @@ func NewServer(id int, peers []int, wg *sync.WaitGroup) *Server {
 	server.lastApplied = 0
 	server.electionResetEvent = time.Now()
 
+	server.nextIndex = make([]int, len(server.peers))
+	server.matchIndex = make([]int, len(server.peers))
+
 	// rpc related server data
 	server.rpcServer = rpc.NewServer()
-	server.rpcServer.RegisterName("gaft", server)
+	if err := server.rpcServer.RegisterName(rpcBase, server); err != nil {
+		log.Fatal(err)
+	}
+
 	server.peerClients = make(map[int]*rpc.Client)
+
+	// for randomized election timeouts
+	rand.Seed(time.Now().UnixNano())
 
 	var err error
 	addr := fmt.Sprintf(":%d", id)
@@ -117,15 +143,14 @@ func NewServer(id int, peers []int, wg *sync.WaitGroup) *Server {
 		panic(err)
 	}
 
-
 	server.log("setup a listener for server %d", server.id)
 	server.start()
 	go server.monitorElectionTimer()
 	return server
 }
 
-func (s *Server) Accept() chan net.Conn { 
-	connChan := make(chan net.Conn)
+func (s *Server) Accept() chan net.Conn {
+	connChan := make(chan net.Conn, 1)
 	conn, err := s.listener.Accept()
 	if err != nil {
 		log.Fatal("listener accept error: ", err)
@@ -147,7 +172,6 @@ func (s *Server) start() {
 					defer s.wg.Done()
 					s.rpcServer.ServeConn(conn)
 				}(conn)
-
 			}
 		}
 	}()
@@ -184,7 +208,7 @@ func (s *Server) Shutdown() {
 func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntriesReply) error {
 	result.Success = false
 
-	if s.currentTerm < args.Term {
+	if s.currentTerm < args.Term && s.state != Follower {
 		s.log("term out of date, transition to follower")
 		s.transitionToFollower(args.Term)
 	}
@@ -259,7 +283,6 @@ func (s *Server) RequestVote(args RequestVoteArguments, result *RequestVoteReply
 	result.VoteGranted = false
 
 	if args.Term > s.currentTerm {
-		s.log("transition to follower")
 		s.transitionToFollower(args.Term)
 	}
 
@@ -277,7 +300,9 @@ func (s *Server) RequestVote(args RequestVoteArguments, result *RequestVoteReply
 		// at this point, vote is allowed to be granted to the candidate
 		result.VoteGranted = true
 		s.votedFor = args.CandidateId
+		// reset election timer
 		s.electionResetEvent = time.Now()
+		go s.monitorElectionTimer()
 	}
 
 	result.Term = s.currentTerm
@@ -285,7 +310,7 @@ func (s *Server) RequestVote(args RequestVoteArguments, result *RequestVoteReply
 	return nil
 }
 
-func (s *Server) stringState() string {
+func (s *Server) String() string {
 	switch s.state {
 	case Leader:
 		return "leader"
@@ -327,57 +352,81 @@ func (s *Server) monitorElectionTimer() {
 	}
 }
 
-func randomizedElectionTimeout() time.Duration {
-	if rand.Intn(5) == 2 {
-		return time.Duration(150) * time.Millisecond
-	}
-	return time.Duration(300) * time.Millisecond
-}
-
 func (s *Server) startElection() {
 	s.state = Candidate
 	s.currentTerm++
 	s.votedFor = s.id
 	s.electionResetEvent = time.Now()
 	votesReceived := 1
-	
-	requestVoteFunc := func(peer int, votesReceived *int) {
-		defer s.wg.Done()
+	majority := len(s.peers)/2 + 1
+
+	requestVoteFunc := func(peer int, votesReceived *int, wg *sync.WaitGroup) {
+		defer wg.Done()
 		// query peerClients to avoid superfluous allocation of the client
 		if _, ok := s.peerClients[peer]; !ok {
+			s.mu.Lock()
 			addr := fmt.Sprintf(":%d", peer)
 			client, err := rpc.Dial("tcp", addr)
 			if err != nil {
 				panic(err)
 			}
 			s.peerClients[peer] = client
+			s.mu.Unlock()
 		}
 		client := s.peerClients[peer]
-		defer s.peerClients[peer].Close()
+		defer client.Close()
 		// write out a logic for sending rpc to a specific client
 		lastLogIndex, lastLogTerm := s.lastLogIndexAndTerm()
-		
-		request := RequestVoteArguments{
-			Term: s.currentTerm,
-			CandidateId: s.id,
+
+		args := RequestVoteArguments{
+			Term:         s.currentTerm,
+			CandidateId:  s.id,
 			LastLogIndex: lastLogIndex,
-			LastLogTerm: lastLogTerm,
+			LastLogTerm:  lastLogTerm,
 		}
 
 		var reply RequestVoteReply
-		client.Call("gaft.RequestVote", request, &reply)
+		retries := 0
+	reachOutLoop:
+		for {
+			select {
+			case err := <-channedRequestVote(client, args, &reply):
+				if err != nil {
+					s.log("%s ended up with error %v", requestVoteEndpoint, err)
+					break reachOutLoop
+				}
+			case <-time.After(rpcCallTimeout):
+				if retries >= maxCallAttempts {
+					break reachOutLoop
+				}
+				retries++
+				// redo the request
+				continue reachOutLoop
+			}
+		}
+
 		s.currentTerm = reply.Term
-		if reply.voteGranted {
+		if reply.VoteGranted {
 			*votesReceived++
 		}
 	}
 
-	s.wg.Add(len(s.peers))
+	wg := sync.WaitGroup{}
+
+	wg.Add(len(s.peers))
 	for _, peer := range s.peers {
-		go requestVoteFunc(peer, &votesReceived)
+		go requestVoteFunc(peer, &votesReceived, &wg)
+	}
+	wg.Wait()
+
+	if votesReceived >= majority {
+		s.log("received majority of votes, transition to a leader")
+		// become a leader
+		s.transitionToLeader()
+		return
 	}
 
-	go monitorElectionTimer()
+	go s.monitorElectionTimer()
 }
 
 func (s *Server) lastLogIndexAndTerm() (int, int) {
@@ -386,6 +435,61 @@ func (s *Server) lastLogIndexAndTerm() (int, int) {
 		return lastIndex, s.logEntries[lastIndex].Term
 	}
 	return -1, -1
+}
+
+func (s *Server) transitionToLeader() {
+	s.state = Leader
+	// send out empty AppendEntries rpcs (heartbeats) to others in the cluster,
+	// so to maintain leader's authority
+
+	// for each server, index of the next log to send to that server
+	// (initialized to leader last log index + 1)
+	lastIndex, _ := s.lastLogIndexAndTerm()
+	for idx, _ := range s.peers {
+		s.nextIndex[idx] = lastIndex + 1
+	}
+
+	sendHeartbeat := func(peer int) {
+		if _, ok := s.peerClients[peer]; !ok {
+			s.mu.Lock()
+			addr := fmt.Sprintf(":%d", peer)
+			client, err := rpc.Dial("tcp", addr)
+			if err != nil {
+				panic(err)
+			}
+			s.peerClients[peer] = client
+			s.mu.Unlock()
+		}
+		client := s.peerClients[peer]
+		defer client.Close()
+		args := AppendEntriesArguments{
+			Term:     s.currentTerm,
+			LeaderId: s.id,
+		}
+		var reply AppendEntriesReply
+		retries := 0
+	reachOutLoop:
+		for {
+			select {
+			case err := <-channedAppendEntries(client, args, &reply):
+				if err != nil {
+					s.log("%s ended up with error %v", appendEntriesEndpoint, err)
+					break reachOutLoop
+				}
+			case <-time.After(rpcCallTimeout):
+				if retries >= maxCallAttempts {
+					break reachOutLoop
+				}
+				retries++
+				// redo request
+				continue reachOutLoop
+			}
+		}
+	}
+
+	for _, peer := range s.peers {
+		go sendHeartbeat(peer)
+	}
 }
 
 func (s *Server) transitionToFollower(term int) {
@@ -399,7 +503,7 @@ func (s *Server) transitionToFollower(term int) {
 }
 
 func (s *Server) log(format string, args ...any) {
-	currState := s.stringState()
+	currState := s.String()
 	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.id, format)
 	log.Printf(extendedFmt, args...)
 }
