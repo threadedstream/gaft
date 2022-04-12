@@ -177,10 +177,17 @@ func (s *Server) start() {
 	}()
 }
 
+func (s *Server) shutdownClientConnections() {
+	for _, client := range s.peerClients {
+		client.Close()
+	}
+}
+
 func (s *Server) Shutdown() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state = Dead
+	s.shutdownClientConnections()
 	s.listener.Close()
 	s.wg.Wait()
 }
@@ -209,11 +216,10 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 	result.Success = false
 
 	if s.currentTerm < args.Term && s.state != Follower {
-		s.log("term out of date, transition to follower")
 		s.transitionToFollower(args.Term)
 	}
 
-	if s.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(s.logEntries) > 0 && s.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
 		return nil
 	}
 
@@ -225,11 +231,11 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 		// resetting election timer, as we've got a heartbeat from a leader
 		s.electionResetEvent = time.Now()
 
-		logInsertIdx := args.PrevLogIndex - 1
+		logInsertIdx := args.PrevLogIndex + 1
 		newEntriesIdx := 0
 
 		for {
-			if logInsertIdx > len(s.logEntries) || newEntriesIdx > len(args.Entries) {
+			if logInsertIdx >= len(s.logEntries) || newEntriesIdx >= len(args.Entries) {
 				break
 			}
 
@@ -282,7 +288,7 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 func (s *Server) RequestVote(args RequestVoteArguments, result *RequestVoteReply) error {
 	result.VoteGranted = false
 
-	if args.Term > s.currentTerm {
+	if args.Term > s.currentTerm && s.state != Follower {
 		s.transitionToFollower(args.Term)
 	}
 
@@ -325,7 +331,7 @@ func (s *Server) String() string {
 
 func (s *Server) monitorElectionTimer() {
 	timeoutDuration := randomizedElectionTimeout()
-	termStarted := s.currentTerm
+	//termStarted := s.currentTerm
 
 	for {
 		time.Sleep(10 * time.Millisecond)
@@ -339,10 +345,10 @@ func (s *Server) monitorElectionTimer() {
 			return
 		}
 
-		if termStarted != s.currentTerm {
-			s.log("termStarted does not match a current term")
-			return
-		}
+		//if termStarted != s.currentTerm {
+		//	s.log("termStarted does not match a current term")
+		//	return
+		//}
 
 		if elapsed := time.Since(s.electionResetEvent); elapsed >= timeoutDuration {
 			s.log("timed out, about to start an election")
@@ -374,7 +380,6 @@ func (s *Server) startElection() {
 			s.mu.Unlock()
 		}
 		client := s.peerClients[peer]
-		defer client.Close()
 		// write out a logic for sending rpc to a specific client
 		lastLogIndex, lastLogTerm := s.lastLogIndexAndTerm()
 
@@ -386,20 +391,16 @@ func (s *Server) startElection() {
 		}
 
 		var reply RequestVoteReply
-		retries := 0
 	reachOutLoop:
 		for {
 			select {
 			case err := <-channedRequestVote(client, args, &reply):
 				if err != nil {
 					s.log("%s ended up with error %v", requestVoteEndpoint, err)
-					break reachOutLoop
+					return
 				}
+				break reachOutLoop
 			case <-time.After(rpcCallTimeout):
-				if retries >= maxCallAttempts {
-					break reachOutLoop
-				}
-				retries++
 				// redo the request
 				continue reachOutLoop
 			}
@@ -461,13 +462,11 @@ func (s *Server) transitionToLeader() {
 			s.mu.Unlock()
 		}
 		client := s.peerClients[peer]
-		defer client.Close()
 		args := AppendEntriesArguments{
 			Term:     s.currentTerm,
 			LeaderId: s.id,
 		}
 		var reply AppendEntriesReply
-		retries := 0
 	reachOutLoop:
 		for {
 			select {
@@ -477,10 +476,6 @@ func (s *Server) transitionToLeader() {
 					break reachOutLoop
 				}
 			case <-time.After(rpcCallTimeout):
-				if retries >= maxCallAttempts {
-					break reachOutLoop
-				}
-				retries++
 				// redo request
 				continue reachOutLoop
 			}

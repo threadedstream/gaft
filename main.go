@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/rpc"
 	"raft/raft"
 	"sync"
 )
@@ -28,6 +29,13 @@ func allocatePorts(n int) []int {
 	}
 
 	return ports
+}
+
+func IssueCommand(command any) {
+	client, err := rpc.Dial("tcp", ":35000")
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
