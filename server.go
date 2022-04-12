@@ -5,7 +5,9 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"math/rand"
 	"time"
+	"fmt"
 )
 
 // arguments and replies for rpc calls
@@ -86,9 +88,11 @@ type Server struct {
 	// concurrency related
 	wg *sync.WaitGroup
 	mu sync.Mutex
+
+	quit <-chan bool
 }
 
-func NewServer(id int, peers []int) *Server {
+func NewServer(id int, peers []int, wg *sync.WaitGroup) *Server {
 	// raft related server data
 	server := new(Server)
 	server.state = Follower
@@ -96,6 +100,7 @@ func NewServer(id int, peers []int) *Server {
 	server.votedFor = -1
 	server.id = id
 	server.peers = peers
+	server.wg = wg
 
 	server.commitIndex = 0
 	server.lastApplied = 0
@@ -104,29 +109,46 @@ func NewServer(id int, peers []int) *Server {
 	// rpc related server data
 	server.rpcServer = rpc.NewServer()
 	server.rpcServer.RegisterName("gaft", server)
+	server.peerClients = make(map[int]*rpc.Client)
 
 	var err error
-	if server.listener, err = net.Listen("tcp", ":0"); err != nil {
-		// TODO(threadedstream): should we panic right away, wouldn't logging suffice?
+	addr := fmt.Sprintf(":%d", id)
+	if server.listener, err = net.Listen("tcp", addr); err != nil {
 		panic(err)
 	}
 
+
 	server.log("setup a listener for server %d", server.id)
+	server.start()
+	go server.monitorElectionTimer()
 	return server
 }
 
-func (s *Server) Start() {
+func (s *Server) Accept() chan net.Conn { 
+	connChan := make(chan net.Conn)
+	conn, err := s.listener.Accept()
+	if err != nil {
+		log.Fatal("listener accept error: ", err)
+	}
+	connChan <- conn
+	return connChan
+}
+
+func (s *Server) start() {
+	s.wg.Add(1)
 	go func() {
 		for {
-			conn, err := s.listener.Accept()
-			if err != nil {
-				log.Fatal("listener accept error: ", err)
+			select {
+			case <-s.quit:
+				return
+			case conn := <-s.Accept():
+				s.wg.Add(1)
+				go func(conn net.Conn) {
+					defer s.wg.Done()
+					s.rpcServer.ServeConn(conn)
+				}(conn)
+
 			}
-			s.wg.Add(1)
-			go func(conn net.Conn) {
-				defer s.wg.Done()
-				s.rpcServer.ServeConn(conn)
-			}(conn)
 		}
 	}()
 }
@@ -163,6 +185,7 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 	result.Success = false
 
 	if s.currentTerm < args.Term {
+		s.log("term out of date, transition to follower")
 		s.transitionToFollower(args.Term)
 	}
 
@@ -205,9 +228,9 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 			result.ConflictIndex = len(s.logEntries)
 			result.ConflictTerm = -1
 		} else {
-			result.ConflictTerm = s.logEntries[s.PrevLogIndex].Term
+			result.ConflictTerm = s.logEntries[args.PrevLogIndex].Term
 			var i int
-			for i = s.PrevLogIndex - 1; i >= 0; i-- {
+			for i = args.PrevLogIndex - 1; i >= 0; i-- {
 				if s.logEntries[i].Term != result.ConflictTerm {
 					break
 				}
@@ -273,4 +296,110 @@ func (s *Server) stringState() string {
 	default:
 		return "undetermined"
 	}
+}
+
+func (s *Server) monitorElectionTimer() {
+	timeoutDuration := randomizedElectionTimeout()
+	termStarted := s.currentTerm
+
+	for {
+		time.Sleep(10 * time.Millisecond)
+
+		if s.commitIndex > s.lastApplied {
+			s.lastApplied++
+		}
+
+		if s.state != Follower && s.state != Candidate {
+			s.log("neither follower nor candidate")
+			return
+		}
+
+		if termStarted != s.currentTerm {
+			s.log("termStarted does not match a current term")
+			return
+		}
+
+		if elapsed := time.Since(s.electionResetEvent); elapsed >= timeoutDuration {
+			s.log("timed out, about to start an election")
+			s.startElection()
+			return
+		}
+	}
+}
+
+func randomizedElectionTimeout() time.Duration {
+	if rand.Intn(5) == 2 {
+		return time.Duration(150) * time.Millisecond
+	}
+	return time.Duration(300) * time.Millisecond
+}
+
+func (s *Server) startElection() {
+	s.state = Candidate
+	s.currentTerm++
+	s.votedFor = s.id
+	s.electionResetEvent = time.Now()
+	votesReceived := 1
+	
+	requestVoteFunc := func(peer int, votesReceived *int) {
+		defer s.wg.Done()
+		// query peerClients to avoid superfluous allocation of the client
+		if _, ok := s.peerClients[peer]; !ok {
+			addr := fmt.Sprintf(":%d", peer)
+			client, err := rpc.Dial("tcp", addr)
+			if err != nil {
+				panic(err)
+			}
+			s.peerClients[peer] = client
+		}
+		client := s.peerClients[peer]
+		defer s.peerClients[peer].Close()
+		// write out a logic for sending rpc to a specific client
+		lastLogIndex, lastLogTerm := s.lastLogIndexAndTerm()
+		
+		request := RequestVoteArguments{
+			Term: s.currentTerm,
+			CandidateId: s.id,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm: lastLogTerm,
+		}
+
+		var reply RequestVoteReply
+		client.Call("gaft.RequestVote", request, &reply)
+		s.currentTerm = reply.Term
+		if reply.voteGranted {
+			*votesReceived++
+		}
+	}
+
+	s.wg.Add(len(s.peers))
+	for _, peer := range s.peers {
+		go requestVoteFunc(peer, &votesReceived)
+	}
+
+	go monitorElectionTimer()
+}
+
+func (s *Server) lastLogIndexAndTerm() (int, int) {
+	if len(s.logEntries) > 0 {
+		lastIndex := len(s.logEntries) - 1
+		return lastIndex, s.logEntries[lastIndex].Term
+	}
+	return -1, -1
+}
+
+func (s *Server) transitionToFollower(term int) {
+	s.log("become a follower with term %d", term)
+	s.state = Follower
+	s.votedFor = -1
+	s.currentTerm = term
+	s.electionResetEvent = time.Now()
+
+	go s.monitorElectionTimer()
+}
+
+func (s *Server) log(format string, args ...any) {
+	currState := s.stringState()
+	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.id, format)
+	log.Printf(extendedFmt, args...)
 }

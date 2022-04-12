@@ -1,82 +1,43 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"math/rand"
-	"time"
+	"sync"
 )
 
-func (s *Server) log(format string, args ...any) {
-	currState := s.stringState()
-	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.id, format)
-	log.Printf(extendedFmt, args)
-}
+const N = 5
 
-func (s *Server) monitorElectionTimer() {
-	timeoutDuration := randomizedElectionTimeout()
-	termStarted := s.currentTerm
-
-	for {
-		time.Sleep(10 * time.Millisecond)
-
-		if s.state != Follower && s.state != Candidate {
-			s.log("neither follower nor candidate")
-			return
+func allBut(all []int, but int) []int{
+	var result []int
+	for _, single := range all {
+		if single == but {
+			continue
 		}
-
-		if termStarted != s.currentTerm {
-			s.log("termStarted does not match a current term")
-			return
-		}
-
-		if elapsed := time.Since(s.electionResetEvent); elapsed >= timeoutDuration {
-			s.log("timed out, about to start an election")
-			s.startElection()
-			return
-		}
+		result = append(result, single)
 	}
+
+	return result
 }
 
-func randomizedElectionTimeout() time.Duration {
-	if rand.Intn(5) == 2 {
-		return time.Duration(150) * time.Millisecond
-	}
-	return time.Duration(300) * time.Millisecond
-}
-
-func (s *Server) startElection() {
-	s.state = Candidate
-	s.currentTerm++
-	s.votedFor = s.id
-	s.electionResetEvent = time.Now()
-
-	requestVoteFunc := func(peer int) {
-
-	}
-	for _, peer := range s.peers {
-
-	}
-}
-
-func (s *Server) lastLogIndexAndTerm() (int, int) {
-	if len(s.logEntries) > 0 {
-		lastIndex := len(s.logEntries) - 1
-		return lastIndex, s.logEntries[lastIndex].Term
-	}
-	return -1, -1
-}
-
-func (s *Server) transitionToFollower(term int) {
-	s.log("become a follower with term %d", term)
-	s.state = Follower
-	s.votedFor = -1
-	s.currentTerm = term
-	s.electionResetEvent = time.Now()
-
-	go s.monitorElectionTimer()
+func allocatePorts(n int) []int{ 
+	var ports []int
+	start := 35000
+	// 35000-45000
+	for port := start; port < start + n; port++ {
+		ports = append(ports, port)
+	}	
+	
+	return ports
 }
 
 func main() {
+	wg := sync.WaitGroup{}
+	var servers [N]*Server
+	ports := allocatePorts(N)
+	// available ports
+	for i, port := range ports {
+		servers[i] = NewServer(port, allBut(ports, port), &wg)
+	}
 
+	wg.Wait()
 }
+
