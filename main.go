@@ -36,6 +36,7 @@ func IssueCommand(command any) {
 	if err != nil {
 		panic(err)
 	}
+	client.Call()
 }
 
 func main() {
