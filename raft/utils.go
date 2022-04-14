@@ -16,7 +16,7 @@ func min(x, y int) int {
 
 func assert(condition bool, format string, args ...any) {
 	if !condition {
-		log.Fatalf(format, args)
+		log.Fatalf(format, args...)
 	}
 }
 
