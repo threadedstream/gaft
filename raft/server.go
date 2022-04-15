@@ -83,8 +83,10 @@ const (
 )
 
 type LogEntry struct {
-	Term    int
-	Command any
+	Term        int
+	ClientId    int
+	SequenceNum int
+	Command     any
 }
 
 type Printable interface {
@@ -153,7 +155,7 @@ func NewRaftServer(id int, peers []int, wg *sync.WaitGroup) *RaftServer {
 	server.nextIndex = make([]int, len(server.peers))
 	server.matchIndex = make([]int, len(server.peers))
 
-	server.fsm = NewRaftFSM()
+	server.fsm = NewRaftFSM(3 * time.Minute)
 	server.fsmResults = make(map[int]any)
 	// rpc related RaftServer data
 	server.rpcRaftServer = rpc.NewServer()
@@ -529,6 +531,29 @@ func (s *RaftServer) monitorElectionTimer() {
 	}
 }
 
+func (s *RaftServer) commit() {
+	for s.commitIndex < len(s.logEntries) {
+		s.commitIndex++
+	}
+}
+
+func (s *RaftServer) replicate() int {
+	votedPositively := 0
+	wg := sync.WaitGroup{}
+	for _, peer := range s.peers {
+		go func(peer int) {
+			reply := s.sendHeartbeat(peer, true, &wg)
+			if reply.Success {
+				votedPositively++
+			}
+		}(peer)
+	}
+
+	wg.Wait()
+
+	return votedPositively
+}
+
 func (s *RaftServer) startElection() {
 	s.state = Candidate
 	s.currentTerm++
@@ -622,7 +647,7 @@ heartbeatLoop:
 		case <-heartbeatTimeout.C:
 			// send heartbeat to each peer
 			for _, peer := range s.peers {
-				go s.sendHeartbeat(peer)
+				go s.sendHeartbeat(peer, false, nil)
 			}
 			heartbeatTimeout.Reset(every)
 		}
@@ -632,7 +657,10 @@ heartbeatLoop:
 	}
 }
 
-func (s *RaftServer) sendHeartbeat(peer int) AppendEntriesReply {
+func (s *RaftServer) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup) AppendEntriesReply {
+	if wg != nil {
+		defer wg.Done()
+	}
 	if _, ok := s.peerClients[peer]; !ok {
 		s.mu.Lock()
 		addr := fmt.Sprintf(":%d", peer)
@@ -644,9 +672,26 @@ func (s *RaftServer) sendHeartbeat(peer int) AppendEntriesReply {
 		s.mu.Unlock()
 	}
 	client := s.peerClients[peer]
-	args := AppendEntriesArguments{
-		Term:     s.currentTerm,
-		LeaderId: s.id,
+	var args AppendEntriesArguments
+	if withLogEntries {
+		var prevLogTerm, prevLogIndex int
+		prevLogIndex = s.commitIndex - 1
+		if prevLogIndex >= 0 && prevLogIndex < len(s.logEntries) {
+			prevLogTerm = s.logEntries[prevLogIndex].Term
+		}
+		args = AppendEntriesArguments{
+			Term:         s.currentTerm,
+			LeaderId:     s.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: s.commitIndex,
+			Entries:      s.logEntries,
+		}
+	} else {
+		args = AppendEntriesArguments{
+			Term:     s.currentTerm,
+			LeaderId: s.id,
+		}
 	}
 	var reply AppendEntriesReply
 reachOutLoop:
@@ -678,7 +723,7 @@ func (s *RaftServer) transitionToLeader() {
 	}
 
 	for _, peer := range s.peers {
-		go s.sendHeartbeat(peer)
+		go s.sendHeartbeat(peer, false, nil)
 	}
 
 	go s.scheduleHeartbeats(randomizedBroadcastPeriod())

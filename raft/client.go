@@ -53,42 +53,62 @@ type RaftClient struct {
 // 	response: 	state machine output, if successful
 //  leaderHint: address of recent leader
 //Receiver implementation:
-// 	1. Reply NOT_LEADER if not leader, providing hint when available
-//  2. Append command to log, replicate and commit it
-//  3. Reply SESSION_EXPIRED if no record of clientId or if response
-// 	   for client's sequenceNum already discarded
-//  4. If sequenceNum already processed from client, reply OK
-// 	   with stored response
-//  5. Apply command in log order
 //  6. Save state machine output with sequenceNum for client, discard any
 // 	   prior response for client
 //  7. Reply OK with state machine output
 func (s *RaftServer) ClientRequest(args ClientRequestArguments, reply *ClientRequestReply) error {
+	// 	1. Reply NOT_LEADER if not leader, providing hint when available
 	if s.state != Leader {
 		reply.Status = NotLeader
 		reply.LeaderHint = s.leaderId
 		return nil
 	}
 	reply.Status = OK
+
+	//  2. Append command to log, replicate and commit it
 	s.logEntries = append(s.logEntries, LogEntry{
-		Term:    s.currentTerm,
-		Command: args.Command,
+		Term:        s.currentTerm,
+		Command:     args.Command,
+		ClientId:    args.ClientId,
+		SequenceNum: args.SequenceNum,
 	})
 
-	if _, ok := s.fsm.sessions[args.ClientId]; !ok {
+replicationStep:
+	votes := s.replicate()
+	if votes < quorum {
+		goto replicationStep
+	}
+
+	s.commit()
+
+	//  3. Reply SESSION_EXPIRED if no record of clientId or if response
+	// 	   for client's sequenceNum already discarded
+	credentials := commandheader{
+		clientId:    args.ClientId,
+		sequenceNum: args.SequenceNum,
+	}
+	_, noClientRecord := s.fsm.sessions[args.ClientId]
+	_, sequenceNumPresent := s.fsm.fsmResults[credentials]
+	if noClientRecord && !sequenceNumPresent {
 		// no session entry associated with a given client
 		reply.Status = SessionExpired
 		return nil
 	}
 
-	credentials := pair{clientId: args.ClientId, sequenceNum: args.SequenceNum}
-	// reply OK if already processed
-	if _, ok := s.fsm.fsmResults[credentials]; ok {
-		reply.Response = s.fsm.fsmResults[credentials]
+	//  4. If sequenceNum already processed from client, reply OK
+	// 	   with stored response
+	if sequenceNumPresent {
+		reply.Response = s.fsm.fsmResults[credentials].result
+		reply.Status = OK
 		return nil
 	}
 
-	// apply commands in log order
+	//  5. Apply command in log order
+	newLogIdx := s.commitIndex + 1
+	for newLogIdx < len(s.logEntries) {
+		entry := s.logEntries[newLogIdx]
+		s.fsm.Apply(entry.ClientId, entry.SequenceNum, entry.Command)
+	}
 
 	// save state machine output of a client's command with
 	// sequenceNum, discard any prior response for client
@@ -135,7 +155,7 @@ func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryRe
 	serversReplied := 0
 
 	feedbackHeartbeat := func(peer int) {
-		reply := s.sendHeartbeat(peer)
+		reply := s.sendHeartbeat(peer, false, nil)
 		if reply.Success {
 			serversReplied++
 		}
@@ -159,4 +179,5 @@ func (s *RaftServer) waitUntilCommittedEntryFromTerm() chan struct{} {
 	}
 
 	out <- struct{}{}
+	return out
 }
