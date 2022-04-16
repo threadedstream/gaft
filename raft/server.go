@@ -362,133 +362,6 @@ func (s *RaftServer) IdentifyLeader(args IdentifyLeaderArguments, reply *Identif
 	return nil
 }
 
-func (s *RaftServer) IssueCommand(args IssueCommandArguments, reply *IssueCommandReply) error {
-	if s.state != Leader {
-		if _, ok := s.peerClients[s.leaderId]; !ok {
-			s.mu.Lock()
-			addr := fmt.Sprintf(":%d", s.leaderId)
-			client, err := rpc.Dial("tcp", addr)
-			if err != nil {
-				panic(err)
-			}
-			s.peerClients[s.leaderId] = client
-			s.mu.Unlock()
-		}
-		client := s.peerClients[s.leaderId]
-	issueCommandRequest:
-		for {
-			select {
-			case err := <-channedRpcCall(issueCommandEndpoint, client, args, reply):
-				if err != nil {
-					// should we indefinitely retry a request
-					s.log("%s ended up with error %v", issueCommandEndpoint, err)
-					return nil
-				}
-				break issueCommandRequest
-			case <-time.After(rpcCallTimeout):
-				// retry the request
-				continue issueCommandRequest
-			}
-		}
-
-		//// delegate it to leader
-		//delegateToLeader := func(args IssueCommandArguments, reply *IssueCommandReply) {
-		//	// first, identify a leader
-		//	identifyLeader := func(peer int, leaderId chan<- int) {
-		//		if _, ok := s.peerClients[peer]; !ok {
-		//			s.mu.Lock()
-		//			addr := fmt.Sprintf(":%d", peer)
-		//			client, err := rpc.Dial("tcp", addr)
-		//			if err != nil {
-		//				panic(err)
-		//			}
-		//			s.peerClients[peer] = client
-		//			s.mu.Unlock()
-		//		}
-		//		client := s.peerClients[peer]
-		//		var identifyArgs IdentifyLeaderArguments
-		//		var identifyReply IdentifyLeaderReply
-		//	identifyLeaderRequest:
-		//		for {
-		//			select {
-		//			case err := <-channedRpcCall(identifyLeaderEndpoint, client, identifyArgs, &identifyReply):
-		//				if err != nil {
-		//					s.log("%s ended up with error %v", identifyLeaderEndpoint, err)
-		//					return
-		//				}
-		//				break identifyLeaderRequest
-		//			case <-time.After(rpcCallTimeout):
-		//				continue identifyLeaderRequest
-		//			}
-		//		}
-		//		leaderId <- identifyReply.Id
-		//	}
-		//
-		//	leaderId := make(chan int)
-		//	for _, peer := range s.peers {
-		//		go identifyLeader(peer, leaderId)
-		//	}
-		//	id := <-leaderId
-		//	// at this point, we've successfully got a leader's port and
-		//	// may easily query the map for a leader's client instance
-		//	client := s.peerClients[id]
-		//issueCommandEndpoint:
-		//	for {
-		//		select {
-		//		case err := <-channedRpcCall(issueCommandEndpoint, client, args, reply):
-		//			if err != nil {
-		//				s.log("%s ended up with error %v", issueCommandEndpoint, err)
-		//				return
-		//			}
-		//			break issueCommandEndpoint
-		//		case <-time.After(rpcCallTimeout):
-		//			// retry the request
-		//			continue issueCommandEndpoint
-		//		}
-		//	}
-		//}
-		//delegateToLeader(args, reply)
-		//return nil
-	}
-
-	s.logEntries = append(s.logEntries, LogEntry{
-		Term:    s.currentTerm,
-		Command: args.Command,
-	})
-
-	//appendEntriesArgs := AppendEntriesArguments{
-	//	Term:         s.currentTerm,
-	//	LeaderId:     s.id,
-	//	PrevLogIndex: s.commitIndex - 1
-	//	PrevLogTerm:
-	//	LeaderCommit: s.commitIndex,
-	//	Entries:      s.logEntries,
-	//}
-	//
-	//// first, replicate log entries across all RaftServers
-	//appendEntries := func(peer int, wg *sync.WaitGroup) {
-	//	if _, ok := s.peerClients[peer]; !ok {
-	//		s.mu.Lock()
-	//		addr := fmt.Sprintf(":%d", peer)
-	//		client, err := rpc.Dial("tcp", addr)
-	//		if err != nil {
-	//			panic(err)
-	//		}
-	//		s.peerClients[peer] = client
-	//		s.mu.Unlock()
-	//	}
-	//	client := s.peerClients[peer]
-	//
-	//	for {
-	//		select {
-	//		case <-channedRpcCall(appendEntriesEndpoint, client, args):
-	//
-	//		}
-	//	}
-	//}
-	return nil
-}
-
 func (s *RaftServer) String() string {
 	switch s.state {
 	case Leader:
@@ -636,13 +509,12 @@ func (s *RaftServer) lastLogIndexAndTerm() (int, int) {
 func (s *RaftServer) scheduleHeartbeats(every time.Duration) {
 	if s.state != Leader {
 		// don't even consider continuing doing anything else, as
-		// we don't deal with a leader
+		// we are not dealing with a leader
 		return
 	}
 
 	heartbeatTimeout := time.NewTicker(every)
-heartbeatLoop:
-	for {
+	for s.state == Leader {
 		select {
 		case <-heartbeatTimeout.C:
 			// send heartbeat to each peer
@@ -650,9 +522,6 @@ heartbeatLoop:
 				go s.sendHeartbeat(peer, false, nil)
 			}
 			heartbeatTimeout.Reset(every)
-		}
-		if s.state != Leader {
-			break heartbeatLoop
 		}
 	}
 }

@@ -53,8 +53,6 @@ type RaftClient struct {
 // 	response: 	state machine output, if successful
 //  leaderHint: address of recent leader
 //Receiver implementation:
-//  6. Save state machine output with sequenceNum for client, discard any
-// 	   prior response for client
 //  7. Reply OK with state machine output
 func (s *RaftServer) ClientRequest(args ClientRequestArguments, reply *ClientRequestReply) error {
 	// 	1. Reply NOT_LEADER if not leader, providing hint when available
@@ -107,9 +105,15 @@ replicationStep:
 	newLogIdx := s.commitIndex + 1
 	for newLogIdx < len(s.logEntries) {
 		entry := s.logEntries[newLogIdx]
-		s.fsm.Apply(entry.ClientId, entry.SequenceNum, entry.Command)
+		s.fsm.Apply(entry.ClientId, entry.SequenceNum, newLogIdx, entry.Command)
 	}
 
+	//  6. Save state machine output with sequenceNum for client, discard any
+	// prior response for client
+	s.fsm.sweepPriorResults(args.ClientId, args.SequenceNum)
+
+	reply.Status = OK
+	reply.Response = s.fsm.fsmResults[commandheader{clientId: args.ClientId, sequenceNum: args.SequenceNum}]
 	// save state machine output of a client's command with
 	// sequenceNum, discard any prior response for client
 	return nil
@@ -129,8 +133,9 @@ func (s *RaftServer) RegisterClient(_ struct{}, reply *RegisterClientReply) erro
 		Command: command,
 	})
 	// apply command in log order
-	newClientId := len(s.logEntries) - 1
-	result := s.fsm.Apply(newClientId, -1, s.logEntries)
+	n := len(s.logEntries) - 1
+	newClientId := n
+	result := s.fsm.Apply(newClientId, -1, n, s.logEntries)
 	if result != FsmOk {
 		reply.Status = result
 		return nil
@@ -168,6 +173,10 @@ func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryRe
 	for serversReplied < quorum {
 		// wait
 	}
+
+	<-s.fsm.waitTill(readIndex)
+
+	reply.Status = OK
 
 	return nil
 }

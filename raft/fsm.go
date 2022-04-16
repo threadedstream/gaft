@@ -22,7 +22,7 @@ const (
 )
 
 type FSM interface {
-	Apply(int, int, any) any
+	Apply(int, int, int, any) any
 }
 
 type pair struct {
@@ -53,10 +53,11 @@ type RaftFSM struct {
 	// all entries associated with some key. Something hints me that
 	// the set is indeed a worthy candidate, however some research is yet to
 	// be done.
-	fsmResults    map[commandheader]commandresult
-	mu            sync.Mutex
-	sweepInterval time.Duration
-	sweepPhase    SweepPhase
+	fsmResults          map[commandheader]commandresult
+	mu                  sync.Mutex
+	sweepInterval       time.Duration
+	sweepPhase          SweepPhase
+	lastAppliedLogIndex int
 }
 
 func NewRaftFSM(sweepInterval time.Duration) *RaftFSM {
@@ -68,7 +69,7 @@ func NewRaftFSM(sweepInterval time.Duration) *RaftFSM {
 	return fsm
 }
 
-func (fsm *RaftFSM) Apply(clientId, sequenceNum int, command any) ExecutionResult {
+func (fsm *RaftFSM) Apply(clientId, sequenceNum, logIndex int, command any) ExecutionResult {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 	// assume for now that command is of type string
@@ -96,6 +97,7 @@ func (fsm *RaftFSM) Apply(clientId, sequenceNum int, command any) ExecutionResul
 	}
 
 	fsm.fsmResults[header] = res
+	fsm.lastAppliedLogIndex = logIndex
 	return FsmOk
 }
 
@@ -111,6 +113,15 @@ func (fsm *RaftFSM) scheduleSweeping() {
 			ticker.Reset(fsm.sweepInterval)
 		}
 	}
+}
+
+func (fsm *RaftFSM) waitTill(idx int) chan struct{} {
+	c := make(chan struct{}, 1)
+	for fsm.lastAppliedLogIndex < idx {
+
+	}
+	c <- struct{}{}
+	return c
 }
 
 func (fsm *RaftFSM) sweep() {

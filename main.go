@@ -1,7 +1,6 @@
 package main
 
 import (
-	"net/rpc"
 	"raft/raft"
 	"sync"
 )
@@ -31,21 +30,13 @@ func allocatePorts(n int) []int {
 	return ports
 }
 
-func IssueCommand(command any) {
-	client, err := rpc.Dial("tcp", ":35000")
-	if err != nil {
-		panic(err)
-	}
-	client.Call()
-}
-
 func main() {
 	wg := sync.WaitGroup{}
-	var servers [N]*raft.Server
+	var servers [N]*raft.RaftServer
 	ports := allocatePorts(N)
 	// available ports
 	for i, port := range ports {
-		servers[i] = raft.NewServer(port, allBut(ports, port), &wg)
+		servers[i] = raft.NewRaftServer(port, allBut(ports, port), &wg)
 	}
 
 	wg.Wait()
