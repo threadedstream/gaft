@@ -21,8 +21,10 @@ const (
 	SweepInProgress
 )
 
-type FSM interface {
-	Apply(int, int, int, any) any
+var _ Applier = &FSM{}
+
+type Applier interface {
+	Apply(int, int, int, any) ExecutionResult
 }
 
 type pair struct {
@@ -40,8 +42,7 @@ type commandresult struct {
 	executionTime any
 }
 
-type RaftFSM struct {
-	FSM
+type FSM struct {
 	// sessions track the latest serial number processed for a client
 	sessions map[int]int
 	// fsmResults stores results of clients' requests
@@ -60,8 +61,8 @@ type RaftFSM struct {
 	lastAppliedLogIndex int
 }
 
-func NewRaftFSM(sweepInterval time.Duration) *RaftFSM {
-	fsm := new(RaftFSM)
+func NewFSM(sweepInterval time.Duration) *FSM {
+	fsm := new(FSM)
 	fsm.sessions = make(map[int]int)
 	fsm.fsmResults = make(map[commandheader]commandresult)
 	fsm.sweepInterval = sweepInterval
@@ -69,7 +70,7 @@ func NewRaftFSM(sweepInterval time.Duration) *RaftFSM {
 	return fsm
 }
 
-func (fsm *RaftFSM) Apply(clientId, sequenceNum, logIndex int, command any) ExecutionResult {
+func (fsm *FSM) Apply(clientId, sequenceNum, logIndex int, command any) ExecutionResult {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 	// assume for now that command is of type string
@@ -101,7 +102,7 @@ func (fsm *RaftFSM) Apply(clientId, sequenceNum, logIndex int, command any) Exec
 	return FsmOk
 }
 
-func (fsm *RaftFSM) scheduleSweeping() {
+func (fsm *FSM) scheduleSweeping() {
 	ticker := time.NewTicker(fsm.sweepInterval)
 	for {
 		select {
@@ -115,7 +116,7 @@ func (fsm *RaftFSM) scheduleSweeping() {
 	}
 }
 
-func (fsm *RaftFSM) waitTill(idx int) chan struct{} {
+func (fsm *FSM) waitTill(idx int) chan struct{} {
 	c := make(chan struct{}, 1)
 	for fsm.lastAppliedLogIndex < idx {
 
@@ -124,7 +125,7 @@ func (fsm *RaftFSM) waitTill(idx int) chan struct{} {
 	return c
 }
 
-func (fsm *RaftFSM) sweep() {
+func (fsm *FSM) sweep() {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 	fsm.sweepPhase = SweepInProgress
@@ -133,7 +134,7 @@ func (fsm *RaftFSM) sweep() {
 	}
 }
 
-func (fsm *RaftFSM) sweepPriorResults(clientId int, lastSeqNum int) {
+func (fsm *FSM) sweepPriorResults(clientId int, lastSeqNum int) {
 	for header, _ := range fsm.fsmResults {
 		if header.clientId == clientId && header.sequenceNum != lastSeqNum {
 			delete(fsm.fsmResults, header)

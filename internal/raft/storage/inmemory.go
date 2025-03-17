@@ -1,41 +1,20 @@
-package raft
+package storage
 
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"sync"
-	_ "unsafe"
 )
 
-type EntryNotFoundError struct {
-	key int
-}
-
-func (err EntryNotFoundError) Error() string {
-	return fmt.Sprintf("entry with key %d hasn't been found", err.key)
-}
-
-//go:linkname throw runtime.throw
-func throw(message string)
-
-var encoder *gob.Encoder
-
-type Storage interface {
-	Get(id int) any
-	Set(id int, data any)
-}
-
-type DefaultStorage struct {
-	Storage
-	mu     sync.Mutex
+type InMemory struct {
+	mu     sync.RWMutex
 	m      map[int][]byte
 	writer *bytes.Buffer
 	reader *bytes.Reader
 }
 
-func NewDefaultStorage() *DefaultStorage {
-	ds := new(DefaultStorage)
+func NewInMemory() *InMemory {
+	ds := new(InMemory)
 	ds.m = make(map[int][]byte)
 	var writerBs []byte
 	ds.writer = bytes.NewBuffer(writerBs)
@@ -43,11 +22,11 @@ func NewDefaultStorage() *DefaultStorage {
 	return ds
 }
 
-func (ds *DefaultStorage) Set(clientId int, command any) error {
+func (ds *InMemory) Set(clientId int, command any) error {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if encoder == nil {
-		throw("call NewDefaultStorage first")
+		throw("call NewInMemory first")
 	}
 	var writerBs []byte
 	buffer := bytes.NewBuffer(writerBs)
@@ -58,9 +37,9 @@ func (ds *DefaultStorage) Set(clientId int, command any) error {
 	return nil
 }
 
-func (ds *DefaultStorage) Get(clientId int) (any, error) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
+func (ds *InMemory) Get(clientId int) (any, error) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
 
 	var ok bool
 	var bs []byte

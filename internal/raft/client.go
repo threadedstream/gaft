@@ -1,5 +1,10 @@
 package raft
 
+import (
+	"sync/atomic"
+	"time"
+)
+
 type ClientRequestStatus = int
 
 const (
@@ -8,53 +13,27 @@ const (
 	SessionExpired
 )
 
-type (
-	ClientRequestArguments struct {
-		ClientId    int
-		SequenceNum int
-		Command     any
-	}
-
-	ClientRequestReply struct {
-		Status     ClientRequestStatus
-		Response   any // should turn into some type later
-		LeaderHint int // the port of a leader's server, if available
-	}
-
-	RegisterClientReply struct {
-		Status     ClientRequestStatus
-		ClientId   int
-		LeaderHint int
-	}
-
-	ClientQueryArguments struct {
-		Query any
-	}
-
-	ClientQueryReply struct {
-		Status     ClientRequestStatus
-		Response   any
-		LeaderHint int
-	}
-)
-
-// RaftClient represents a client making requests to the RaftServer
-type RaftClient struct {
-	clientId int
+// Client represents a client making requests to the RaftServer
+type Client struct {
+	ID int
 }
 
-//ClientRequest RPC
-//Arguments:
-// 	clientId:	 	client invoking request
-// 	sequenceNum:		to eliminate duplicates
-// 	command:			request for state machine, may affect state
-//Results:
-//	status: 	OK if state machine applied command
-// 	response: 	state machine output, if successful
-//  leaderHint: address of recent leader
-//Receiver implementation:
+// ClientRequest RPC
+// Arguments:
+//
+//	clientId:	 	client invoking request
+//	sequenceNum:		to eliminate duplicates
+//	command:			request for state machine, may affect state
+//
+// Results:
+//
+//		status: 	OK if state machine applied command
+//		response: 	state machine output, if successful
+//	 leaderHint: address of recent leader
+//
+// Receiver implementation:
 //  7. Reply OK with state machine output
-func (s *RaftServer) ClientRequest(args ClientRequestArguments, reply *ClientRequestReply) error {
+func (s *Server) ClientRequest(args ClientRequestArguments, reply *ClientRequestReply) error {
 	// 	1. Reply NOT_LEADER if not leader, providing hint when available
 	if s.state != Leader {
 		reply.Status = NotLeader
@@ -65,7 +44,7 @@ func (s *RaftServer) ClientRequest(args ClientRequestArguments, reply *ClientReq
 
 	//  2. Append command to log, replicate and commit it
 	s.logEntries = append(s.logEntries, LogEntry{
-		Term:        s.currentTerm,
+		Term:        int(s.currentTerm.Load()),
 		Command:     args.Command,
 		ClientId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
@@ -119,7 +98,7 @@ replicationStep:
 	return nil
 }
 
-func (s *RaftServer) RegisterClient(_ struct{}, reply *RegisterClientReply) error {
+func (s *Server) RegisterClient(_ struct{}, reply *RegisterClientReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state != Leader {
@@ -129,7 +108,7 @@ func (s *RaftServer) RegisterClient(_ struct{}, reply *RegisterClientReply) erro
 	}
 	command := "register client"
 	s.logEntries = append(s.logEntries, LogEntry{
-		Term:    s.currentTerm,
+		Term:    int(s.currentTerm.Load()),
 		Command: command,
 	})
 	// apply command in log order
@@ -146,7 +125,7 @@ func (s *RaftServer) RegisterClient(_ struct{}, reply *RegisterClientReply) erro
 	return nil
 }
 
-func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryReply) error {
+func (s *Server) ClientQuery(_ ClientQueryArguments, reply *ClientQueryReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state != Leader {
@@ -157,12 +136,13 @@ func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryRe
 	// Wait until last committed entry is from this leader's term
 	<-s.waitUntilCommittedEntryFromTerm()
 	readIndex := s.commitIndex
-	serversReplied := 0
+
+	var serversReplied atomic.Int32
 
 	feedbackHeartbeat := func(peer int) {
 		reply := s.sendHeartbeat(peer, false, nil)
 		if reply.Success {
-			serversReplied++
+			serversReplied.Add(1)
 		}
 	}
 
@@ -170,7 +150,7 @@ func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryRe
 		go feedbackHeartbeat(peer)
 	}
 
-	for serversReplied < quorum {
+	for int(serversReplied.Load()) < quorum {
 		// wait
 	}
 
@@ -181,10 +161,10 @@ func (s *RaftServer) ClientQuery(args ClientQueryArguments, reply *ClientQueryRe
 	return nil
 }
 
-func (s *RaftServer) waitUntilCommittedEntryFromTerm() chan struct{} {
+func (s *Server) waitUntilCommittedEntryFromTerm() chan struct{} {
 	out := make(chan struct{}, 1)
-	for s.logEntries[s.commitIndex].Term != s.currentTerm {
-
+	for s.logEntries[s.commitIndex].Term != int(s.currentTerm.Load()) {
+		time.Sleep(time.Millisecond * 100)
 	}
 
 	out <- struct{}{}

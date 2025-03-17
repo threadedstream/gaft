@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,52 +27,6 @@ const (
 
 // initialized in NewRaftServer()
 var quorum = -1
-
-// arguments and replies for rpc calls
-type (
-	AppendEntriesArguments struct {
-		Term         int
-		LeaderId     int
-		PrevLogIndex int
-		PrevLogTerm  int
-		LeaderCommit int
-		Entries      []LogEntry
-	}
-
-	AppendEntriesReply struct {
-		Term          int
-		Success       bool
-		ConflictTerm  int
-		ConflictIndex int
-	}
-
-	RequestVoteArguments struct {
-		Term         int
-		CandidateId  int
-		LastLogIndex int
-		LastLogTerm  int
-	}
-
-	RequestVoteReply struct {
-		Term        int
-		VoteGranted bool
-	}
-
-	IssueCommandArguments struct {
-		Command any
-	}
-
-	IssueCommandReply struct {
-		Result any
-	}
-
-	IdentifyLeaderArguments struct {
-	}
-
-	IdentifyLeaderReply struct {
-		Id int
-	}
-)
 
 type state int
 
@@ -93,19 +48,19 @@ type Printable interface {
 	String() string
 }
 
-// RaftServer represents a single unit in cluster of RaftServers
-type RaftServer struct {
+// Server represents a single unit in cluster of raft servers
+type Server struct {
 	Printable
 	state
-	// RaftServer's id
+	// Server's id
 	id int
 	// leader's id
 	leaderId int
 	// other RaftServers in a cluster
 	peers []int
-	// latest term RaftServer has seen (initialized to 0 on first boot, increases monotonically)
-	currentTerm int
-	// latest term RaftServer has seen (initialized to 0 on first boot, increases monotonically)
+	// latest term Server has seen (initialized to 0 on first boot, increases monotonically)
+	currentTerm atomic.Int64
+	// latest term Server has seen (initialized to 0 on first boot, increases monotonically)
 	votedFor int
 	// log entries; each entry contains command
 	// for state machine, and term when entry
@@ -122,9 +77,9 @@ type RaftServer struct {
 	electionResetEvent time.Time
 
 	// rpc related stuff
-	rpcRaftServer *rpc.Server
-	listener      net.Listener
-	peerClients   map[int]*rpc.Client
+	rpcServer   *rpc.Server
+	listener    net.Listener
+	peerClients map[int]*rpc.Client
 
 	// concurrency related
 	wg *sync.WaitGroup
@@ -133,16 +88,16 @@ type RaftServer struct {
 	quit <-chan bool
 
 	// finite-state machine executing commands
-	fsm *RaftFSM
+	fsm *FSM
 	// map from clientId to the result of previously executed command
 	fsmResults map[int]any
 }
 
-func NewRaftServer(id int, peers []int, wg *sync.WaitGroup) *RaftServer {
-	// raft related RaftServer data
-	server := new(RaftServer)
+func NewServer(id int, peers []int, wg *sync.WaitGroup) *Server {
+	// raft related Server data
+	server := new(Server)
 	server.state = Follower
-	server.currentTerm = 0
+	server.currentTerm.Store(0)
 	server.votedFor = -1
 	server.id = id
 	server.peers = peers
@@ -155,11 +110,11 @@ func NewRaftServer(id int, peers []int, wg *sync.WaitGroup) *RaftServer {
 	server.nextIndex = make([]int, len(server.peers))
 	server.matchIndex = make([]int, len(server.peers))
 
-	server.fsm = NewRaftFSM(3 * time.Minute)
+	server.fsm = NewFSM(3 * time.Minute)
 	server.fsmResults = make(map[int]any)
-	// rpc related RaftServer data
-	server.rpcRaftServer = rpc.NewServer()
-	if err := server.rpcRaftServer.RegisterName(rpcBase, server); err != nil {
+	// rpc related Server data
+	server.rpcServer = rpc.NewServer()
+	if err := server.rpcServer.RegisterName(rpcBase, server); err != nil {
 		log.Fatal(err)
 	}
 
@@ -178,13 +133,13 @@ func NewRaftServer(id int, peers []int, wg *sync.WaitGroup) *RaftServer {
 		panic(err)
 	}
 
-	server.log("setup a listener for RaftServer %d", server.id)
+	server.log("setup a listener for Server %d", server.id)
 	server.start()
 	go server.monitorElectionTimer()
 	return server
 }
 
-func (s *RaftServer) Accept() chan net.Conn {
+func (s *Server) Accept() chan net.Conn {
 	connChan := make(chan net.Conn, 1)
 	conn, err := s.listener.Accept()
 	if err != nil {
@@ -194,7 +149,7 @@ func (s *RaftServer) Accept() chan net.Conn {
 	return connChan
 }
 
-func (s *RaftServer) start() {
+func (s *Server) start() {
 	s.wg.Add(1)
 	go func() {
 		for {
@@ -205,20 +160,20 @@ func (s *RaftServer) start() {
 				s.wg.Add(1)
 				go func(conn net.Conn) {
 					defer s.wg.Done()
-					s.rpcRaftServer.ServeConn(conn)
+					s.rpcServer.ServeConn(conn)
 				}(conn)
 			}
 		}
 	}()
 }
 
-func (s *RaftServer) shutdownClientConnections() {
+func (s *Server) shutdownClientConnections() {
 	for _, client := range s.peerClients {
 		client.Close()
 	}
 }
 
-func (s *RaftServer) Shutdown() {
+func (s *Server) Shutdown() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state = Dead
@@ -228,17 +183,17 @@ func (s *RaftServer) Shutdown() {
 }
 
 // AppendEntries RPC
-//Arguments:
+// Arguments:
 // term: leader’s term
 // leaderId: 	so follower can redirect clients
 // prevLogIndex:  index of log entry immediately preceding new ones
 // prevLogTerm:   term of prevLogIndex entry
 // entries[]: 	 log entries to store (empty for heartbeat; may send more than one for efficiency)
 // leaderCommit: leader’s commitIndex
-//Results:
+// Results:
 // term: currentTerm, for leader to update itself
 // success: true if follower contained entry matching prevLogIndex and prevLogTerm
-//Receiver implementation:
+// Receiver implementation:
 // 1. Reply false if term < currentTerm (§5.1)
 // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
 // 3. If an existing entry conflicts with a new one (same index
@@ -247,10 +202,10 @@ func (s *RaftServer) Shutdown() {
 // 5. If leaderCommit > commitIndex, set commitIndex =
 // 4. Append any new entries not already in the log
 // min(leaderCommit, index of last new entry)
-func (s *RaftServer) AppendEntries(args AppendEntriesArguments, result *AppendEntriesReply) error {
+func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntriesReply) error {
 	result.Success = false
 
-	if s.currentTerm < args.Term && s.state != Follower {
+	if int(s.currentTerm.Load()) <= args.Term && s.state != Follower {
 		s.transitionToFollower(args.Term)
 	}
 
@@ -309,32 +264,29 @@ func (s *RaftServer) AppendEntries(args AppendEntriesArguments, result *AppendEn
 }
 
 // RequestVote RPC
-//Arguments:
+// Arguments:
 // term: candidate’s term
 // candidateId: candidate requesting vote
 // lastLogIndex: index of candidate’s last log entry (§5.4)
 // lastLogTerm:  term of candidate’s last log entry (§5.4)
-//Results:
+// Results:
 // term: currentTerm, for candidate to update itself
 // voteGranted: true means candidate received vote
-//Receiver implementation:
+// Receiver implementation:
 // 1. Reply false if term < currentTerm (§5.1)
 // 2. If votedFor is null or candidateId, and candidate’s log is at
 // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-func (s *RaftServer) RequestVote(args RequestVoteArguments, result *RequestVoteReply) error {
+func (s *Server) RequestVote(args RequestVoteArguments, result *RequestVoteReply) error {
 	result.VoteGranted = false
 
-	s.electionResetEvent = time.Now()
-	go s.monitorElectionTimer()
-
-	if args.Term > s.currentTerm && s.state != Follower {
+	if args.Term > int(s.currentTerm.Load()) && s.state != Follower {
 		s.transitionToFollower(args.Term)
 	}
 
 	lastLogIndex, lastLogTerm := s.lastLogIndexAndTerm()
 
 	// kind of weird, but I enjoy writing it that way
-	termsEqual := args.Term == s.currentTerm
+	termsEqual := args.Term == int(s.currentTerm.Load())
 	votedForIsNullOrCandidateId := s.votedFor == -1 || s.votedFor == args.CandidateId
 	candLastLogTermGtRaftServers := args.LastLogTerm > lastLogTerm
 	lastLogTermsEqualAndCandLastIndexGteRaftServers := args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex
@@ -348,12 +300,12 @@ func (s *RaftServer) RequestVote(args RequestVoteArguments, result *RequestVoteR
 		// reset election timer
 	}
 
-	result.Term = s.currentTerm
+	result.Term = int(s.currentTerm.Load())
 
 	return nil
 }
 
-func (s *RaftServer) IdentifyLeader(args IdentifyLeaderArguments, reply *IdentifyLeaderReply) error {
+func (s *Server) IdentifyLeader(_ struct{}, reply *IdentifyLeaderReply) error {
 	if s.state != Leader {
 		reply.Id = -1
 		return nil
@@ -362,7 +314,7 @@ func (s *RaftServer) IdentifyLeader(args IdentifyLeaderArguments, reply *Identif
 	return nil
 }
 
-func (s *RaftServer) String() string {
+func (s *Server) String() string {
 	switch s.state {
 	case Leader:
 		return "leader"
@@ -375,7 +327,7 @@ func (s *RaftServer) String() string {
 	}
 }
 
-func (s *RaftServer) monitorElectionTimer() {
+func (s *Server) monitorElectionTimer() {
 	timeoutDuration := randomizedElectionTimeout()
 	//termStarted := s.currentTerm
 
@@ -404,13 +356,13 @@ func (s *RaftServer) monitorElectionTimer() {
 	}
 }
 
-func (s *RaftServer) commit() {
+func (s *Server) commit() {
 	for s.commitIndex < len(s.logEntries) {
 		s.commitIndex++
 	}
 }
 
-func (s *RaftServer) replicate() int {
+func (s *Server) replicate() int {
 	votedPositively := 0
 	wg := sync.WaitGroup{}
 	for _, peer := range s.peers {
@@ -427,9 +379,9 @@ func (s *RaftServer) replicate() int {
 	return votedPositively
 }
 
-func (s *RaftServer) startElection() {
+func (s *Server) startElection() {
 	s.state = Candidate
-	s.currentTerm++
+	s.currentTerm.Add(1)
 	s.votedFor = s.id
 	s.electionResetEvent = time.Now()
 	votesReceived := 1
@@ -452,7 +404,7 @@ func (s *RaftServer) startElection() {
 		lastLogIndex, lastLogTerm := s.lastLogIndexAndTerm()
 
 		args := RequestVoteArguments{
-			Term:         s.currentTerm,
+			Term:         int(s.currentTerm.Load()),
 			CandidateId:  s.id,
 			LastLogIndex: lastLogIndex,
 			LastLogTerm:  lastLogTerm,
@@ -474,7 +426,7 @@ func (s *RaftServer) startElection() {
 			}
 		}
 
-		s.currentTerm = reply.Term
+		s.currentTerm.Store(int64(reply.Term))
 		if reply.VoteGranted {
 			*votesReceived++
 		}
@@ -498,7 +450,7 @@ func (s *RaftServer) startElection() {
 	go s.monitorElectionTimer()
 }
 
-func (s *RaftServer) lastLogIndexAndTerm() (int, int) {
+func (s *Server) lastLogIndexAndTerm() (int, int) {
 	if len(s.logEntries) > 0 {
 		lastIndex := len(s.logEntries) - 1
 		return lastIndex, s.logEntries[lastIndex].Term
@@ -506,7 +458,7 @@ func (s *RaftServer) lastLogIndexAndTerm() (int, int) {
 	return -1, -1
 }
 
-func (s *RaftServer) scheduleHeartbeats(every time.Duration) {
+func (s *Server) scheduleHeartbeats(every time.Duration) {
 	if s.state != Leader {
 		// don't even consider continuing doing anything else, as
 		// we are not dealing with a leader
@@ -526,7 +478,7 @@ func (s *RaftServer) scheduleHeartbeats(every time.Duration) {
 	}
 }
 
-func (s *RaftServer) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup) AppendEntriesReply {
+func (s *Server) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup) AppendEntriesReply {
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -549,7 +501,7 @@ func (s *RaftServer) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitG
 			prevLogTerm = s.logEntries[prevLogIndex].Term
 		}
 		args = AppendEntriesArguments{
-			Term:         s.currentTerm,
+			Term:         int(s.currentTerm.Load()),
 			LeaderId:     s.id,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
@@ -558,7 +510,7 @@ func (s *RaftServer) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitG
 		}
 	} else {
 		args = AppendEntriesArguments{
-			Term:     s.currentTerm,
+			Term:     int(s.currentTerm.Load()),
 			LeaderId: s.id,
 		}
 	}
@@ -579,12 +531,12 @@ reachOutLoop:
 	return reply
 }
 
-func (s *RaftServer) transitionToLeader() {
+func (s *Server) transitionToLeader() {
 	s.state = Leader
 	// send out empty AppendEntries rpcs (heartbeats) to others in the cluster,
 	// so to maintain leader's authority
 
-	// for each RaftServer, index of the next log to send to that RaftServer
+	// for each Server, index of the next log to send to that Server
 	// (initialized to leader last log index + 1)
 	lastIndex, _ := s.lastLogIndexAndTerm()
 	for idx, _ := range s.peers {
@@ -598,17 +550,17 @@ func (s *RaftServer) transitionToLeader() {
 	go s.scheduleHeartbeats(randomizedBroadcastPeriod())
 }
 
-func (s *RaftServer) transitionToFollower(term int) {
+func (s *Server) transitionToFollower(term int) {
 	s.log("become a follower with term %d", term)
 	s.state = Follower
 	s.votedFor = -1
-	s.currentTerm = term
+	s.currentTerm.Store(int64(term))
 	s.electionResetEvent = time.Now()
 
 	go s.monitorElectionTimer()
 }
 
-func (s *RaftServer) log(format string, args ...any) {
+func (s *Server) log(format string, args ...any) {
 	currState := s.String()
 	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.id, format)
 	log.Printf(extendedFmt, args...)

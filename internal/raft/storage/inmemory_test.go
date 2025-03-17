@@ -1,4 +1,4 @@
-package raft
+package storage
 
 import (
 	"fmt"
@@ -6,14 +6,14 @@ import (
 )
 
 func TestSet(t *testing.T) {
-	s := NewDefaultStorage()
+	s := NewInMemory()
 	if err := s.Set(1, "make a sandwich"); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestGet(t *testing.T) {
-	s := NewDefaultStorage()
+	s := NewInMemory()
 	command := "make a sandwich"
 	if err := s.Set(1, command); err != nil {
 		t.Fatal(err)
@@ -31,7 +31,7 @@ func TestGet(t *testing.T) {
 }
 
 func TestStress(t *testing.T) {
-	s := NewDefaultStorage()
+	s := NewInMemory()
 	commandFmt := "make a %d-th sandwich"
 	var result any
 	var err error
