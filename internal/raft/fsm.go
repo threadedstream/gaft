@@ -118,10 +118,12 @@ func (fsm *FSM) scheduleSweeping() {
 
 func (fsm *FSM) waitTill(idx int) chan struct{} {
 	c := make(chan struct{}, 1)
-	for fsm.lastAppliedLogIndex < idx {
+	go func() {
+		for fsm.lastAppliedLogIndex < idx {
 
-	}
-	c <- struct{}{}
+		}
+		c <- struct{}{}
+	}()
 	return c
 }
 

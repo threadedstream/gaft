@@ -81,7 +81,7 @@ replicationStep:
 	}
 
 	//  5. Apply command in log order
-	newLogIdx := s.commitIndex + 1
+	newLogIdx := int(s.commitIndex.Load() + 1)
 	for newLogIdx < len(s.logEntries) {
 		entry := s.logEntries[newLogIdx]
 		s.fsm.Apply(entry.ClientId, entry.SequenceNum, newLogIdx, entry.Command)
@@ -135,7 +135,7 @@ func (s *Server) ClientQuery(_ ClientQueryArguments, reply *ClientQueryReply) er
 	}
 	// Wait until last committed entry is from this leader's term
 	<-s.waitUntilCommittedEntryFromTerm()
-	readIndex := s.commitIndex
+	readIndex := int(s.commitIndex.Load())
 
 	var serversReplied atomic.Int32
 
@@ -163,7 +163,7 @@ func (s *Server) ClientQuery(_ ClientQueryArguments, reply *ClientQueryReply) er
 
 func (s *Server) waitUntilCommittedEntryFromTerm() chan struct{} {
 	out := make(chan struct{}, 1)
-	for s.logEntries[s.commitIndex].Term != int(s.currentTerm.Load()) {
+	for s.logEntries[s.commitIndex.Load()].Term != int(s.currentTerm.Load()) {
 		time.Sleep(time.Millisecond * 100)
 	}
 

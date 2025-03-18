@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -67,8 +68,8 @@ type Server struct {
 	// was received by leader (first index is 1)
 	logEntries []LogEntry
 	// volatile state on RaftServers
-	commitIndex int
-	lastApplied int
+	commitIndex atomic.Int64
+	lastApplied atomic.Int64
 	// volatile state on leaders
 	nextIndex  []int
 	matchIndex []int
@@ -103,8 +104,6 @@ func NewServer(id int, peers []int, wg *sync.WaitGroup) *Server {
 	server.peers = peers
 	server.wg = wg
 
-	server.commitIndex = 0
-	server.lastApplied = 0
 	server.electionResetEvent = time.Now()
 
 	server.nextIndex = make([]int, len(server.peers))
@@ -199,27 +198,30 @@ func (s *Server) Shutdown() {
 // 3. If an existing entry conflicts with a new one (same index
 // but different terms), delete the existing entry and all that
 // follow it (§5.3)
-// 5. If leaderCommit > commitIndex, set commitIndex =
 // 4. Append any new entries not already in the log
-// min(leaderCommit, index of last new entry)
+// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntriesReply) error {
 	result.Success = false
+
+	if args.Term < int(s.currentTerm.Load()) {
+		return errors.New("stale term")
+	}
 
 	if int(s.currentTerm.Load()) <= args.Term && s.state != Follower {
 		s.transitionToFollower(args.Term)
 	}
 
+	// resetting election timer, as we've got a heartbeat from a leader
+	s.electionResetEvent = time.Now()
+
 	if len(s.logEntries) > 0 && s.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
-		return nil
+		return errors.New("different terms at prevLogIndex")
 	}
 
 	if args.PrevLogIndex == -1 ||
 		args.PrevLogIndex < len(s.logEntries) {
 
 		result.Success = true
-
-		// resetting election timer, as we've got a heartbeat from a leader
-		s.electionResetEvent = time.Now()
 
 		logInsertIdx := args.PrevLogIndex + 1
 		newEntriesIdx := 0
@@ -240,8 +242,8 @@ func (s *Server) AppendEntries(args AppendEntriesArguments, result *AppendEntrie
 			s.logEntries = append(s.logEntries[:logInsertIdx], args.Entries[newEntriesIdx:]...)
 		}
 
-		if args.LeaderCommit > s.commitIndex {
-			s.commitIndex = min(args.LeaderCommit, len(s.logEntries)-1)
+		if args.LeaderCommit > int(s.commitIndex.Load()) {
+			s.commitIndex.Store(int64(min(args.LeaderCommit, len(s.logEntries)-1)))
 		}
 		s.leaderId = args.LeaderId
 	} else {
@@ -329,24 +331,18 @@ func (s *Server) String() string {
 
 func (s *Server) monitorElectionTimer() {
 	timeoutDuration := randomizedElectionTimeout()
-	//termStarted := s.currentTerm
 
 	for {
 		time.Sleep(10 * time.Millisecond)
 
-		if s.commitIndex > s.lastApplied {
-			s.lastApplied++
+		if s.commitIndex.Load() > s.lastApplied.Load() {
+			s.lastApplied.Add(1)
 		}
 
 		if s.state != Follower && s.state != Candidate {
 			s.log("neither follower nor candidate")
 			return
 		}
-
-		//if termStarted != s.currentTerm {
-		//	s.log("termStarted does not match a current term")
-		//	return
-		//}
 
 		if elapsed := time.Since(s.electionResetEvent); elapsed >= timeoutDuration {
 			s.log("timed out, about to start an election")
@@ -357,8 +353,8 @@ func (s *Server) monitorElectionTimer() {
 }
 
 func (s *Server) commit() {
-	for s.commitIndex < len(s.logEntries) {
-		s.commitIndex++
+	for int(s.commitIndex.Load()) < len(s.logEntries) {
+		s.commitIndex.Add(1)
 	}
 }
 
@@ -496,7 +492,7 @@ func (s *Server) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup
 	var args AppendEntriesArguments
 	if withLogEntries {
 		var prevLogTerm, prevLogIndex int
-		prevLogIndex = s.commitIndex - 1
+		prevLogIndex = int(s.commitIndex.Load() - 1)
 		if prevLogIndex >= 0 && prevLogIndex < len(s.logEntries) {
 			prevLogTerm = s.logEntries[prevLogIndex].Term
 		}
@@ -505,7 +501,7 @@ func (s *Server) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup
 			LeaderId:     s.id,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
-			LeaderCommit: s.commitIndex,
+			LeaderCommit: int(s.commitIndex.Load()),
 			Entries:      s.logEntries,
 		}
 	} else {
