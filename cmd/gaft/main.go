@@ -1,32 +1,38 @@
 package main
 
 import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os/signal"
+	"raft/internal/config"
 	"raft/internal/raft"
-	"sync"
-
-	"github.com/travisjeffery/go-dynaport"
+	"syscall"
 )
 
-const N = 5
-
-func allBut(ports []int, port int) []int {
-	result := make([]int, 0, len(ports)-1)
-	for _, p := range ports {
-		if p != port {
-			result = append(result, p)
-		}
-	}
-	return result
-}
+var (
+	port          = flag.Int("port", 0, "port to listen on")
+	bootstrapFile = flag.String("bf", "", "file to bootstrap raft cluster")
+)
 
 func main() {
-	wg := sync.WaitGroup{}
-	var servers [N]*raft.Server
-	ports := dynaport.Get(N)
-	// available ports
-	for i, port := range ports {
-		servers[i] = raft.NewServer(port, allBut(ports, port), &wg)
+	flag.Parse()
+	if *port == 0 {
+		log.Fatal("port must be specified")
+	}
+	if *bootstrapFile == "" {
+		log.Fatal("file to bootstrap raft cluster must be specified")
 	}
 
-	wg.Wait()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	c, err := config.Parse(*bootstrapFile)
+	if err != nil {
+		log.Fatal(fmt.Errorf("parse config: %w", err))
+	}
+
+	server := raft.NewServer(ctx, *port, c.ServersInCluster)
+	server.Start()
 }
