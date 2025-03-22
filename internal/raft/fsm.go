@@ -116,17 +116,6 @@ func (fsm *FSM) scheduleSweeping() {
 	}
 }
 
-func (fsm *FSM) waitTill(idx int) chan struct{} {
-	c := make(chan struct{}, 1)
-	go func() {
-		for fsm.lastAppliedLogIndex < idx {
-
-		}
-		c <- struct{}{}
-	}()
-	return c
-}
-
 func (fsm *FSM) sweep() {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()

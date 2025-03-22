@@ -82,7 +82,7 @@ type Server struct {
 
 	// concurrency related
 	wg *sync.WaitGroup
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// global context
 	ctx context.Context
@@ -365,7 +365,7 @@ func (s *Server) replicate() int {
 	wg := sync.WaitGroup{}
 	for _, peer := range s.peers {
 		go func(peer int) {
-			reply := s.sendHeartbeat(peer, true, &wg)
+			reply := s.sendHeartbeat(peer, true)
 			if reply.Success {
 				votedPositively++
 			}
@@ -451,6 +451,9 @@ func (s *Server) startElection() {
 }
 
 func (s *Server) lastLogIndexAndTerm() (int, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if len(s.logEntries) > 0 {
 		lastIndex := len(s.logEntries) - 1
 		return lastIndex, s.logEntries[lastIndex].Term
@@ -468,29 +471,31 @@ func (s *Server) scheduleHeartbeats(every time.Duration) {
 	heartbeatTimeout := time.NewTicker(every)
 	for s.state == Leader {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-heartbeatTimeout.C:
 			// send heartbeat to each peer
 			for _, peer := range s.peers {
-				go s.sendHeartbeat(peer, false, nil)
+				s.wg.Add(1)
+				go s.sendHeartbeat(peer, false)
 			}
-			heartbeatTimeout.Reset(every)
 		}
 	}
 }
 
-func (s *Server) sendHeartbeat(peer int, withLogEntries bool, wg *sync.WaitGroup) AppendEntriesReply {
-	if wg != nil {
-		defer wg.Done()
-	}
+func (s *Server) sendHeartbeat(peer int, withLogEntries bool) AppendEntriesReply {
+	defer s.wg.Done()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if _, ok := s.peerClients[peer]; !ok {
-		s.mu.Lock()
 		addr := fmt.Sprintf(":%d", peer)
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
-			panic(err)
+			s.fatal("failed to dial client", err)
 		}
 		s.peerClients[peer] = client
-		s.mu.Unlock()
 	}
 	client := s.peerClients[peer]
 	var args AppendEntriesArguments
@@ -544,9 +549,11 @@ func (s *Server) transitionToLeader() {
 	}
 
 	for _, peer := range s.peers {
-		go s.sendHeartbeat(peer, false, nil)
+		s.wg.Add(1)
+		go s.sendHeartbeat(peer, false)
 	}
 
+	s.wg.Add(1)
 	go s.scheduleHeartbeats(randomizedBroadcastPeriod())
 }
 
@@ -564,4 +571,10 @@ func (s *Server) log(format string, args ...any) {
 	currState := s.String()
 	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.me, format)
 	log.Printf(extendedFmt, args...)
+}
+
+func (s *Server) fatal(format string, args ...any) {
+	currState := s.String()
+	extendedFmt := fmt.Sprintf("[%s(%d)]: %s", currState, s.me, format)
+	log.Fatalf(extendedFmt, args...)
 }

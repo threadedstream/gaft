@@ -1,8 +1,9 @@
 package raft
 
 import (
+	"errors"
+	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type ClientRequestStatus = int
@@ -44,7 +45,7 @@ func (s *Server) ClientRequest(args ClientRequestArguments, reply *ClientRequest
 
 	//  2. Append command to log, replicate and commit it
 	s.logEntries = append(s.logEntries, LogEntry{
-		Term:        int(s.currentTerm.Load()),
+		Term:        s.currentTerm,
 		Command:     args.Command,
 		ClientId:    args.ClientId,
 		SequenceNum: args.SequenceNum,
@@ -66,6 +67,7 @@ replicationStep:
 	}
 	_, noClientRecord := s.fsm.sessions[args.ClientId]
 	_, sequenceNumPresent := s.fsm.fsmResults[credentials]
+
 	if noClientRecord && !sequenceNumPresent {
 		// no session entry associated with a given client
 		reply.Status = SessionExpired
@@ -81,7 +83,7 @@ replicationStep:
 	}
 
 	//  5. Apply command in log order
-	newLogIdx := int(s.commitIndex.Load() + 1)
+	newLogIdx := s.commitIndex + 1
 	for newLogIdx < len(s.logEntries) {
 		entry := s.logEntries[newLogIdx]
 		s.fsm.Apply(entry.ClientId, entry.SequenceNum, newLogIdx, entry.Command)
@@ -108,7 +110,7 @@ func (s *Server) RegisterClient(_ struct{}, reply *RegisterClientReply) error {
 	}
 	command := "register client"
 	s.logEntries = append(s.logEntries, LogEntry{
-		Term:    int(s.currentTerm.Load()),
+		Term:    s.currentTerm,
 		Command: command,
 	})
 	// apply command in log order
@@ -133,40 +135,40 @@ func (s *Server) ClientQuery(_ ClientQueryArguments, reply *ClientQueryReply) er
 		reply.LeaderHint = s.leaderId
 		return nil
 	}
-	// Wait until last committed entry is from this leader's term
-	<-s.waitUntilCommittedEntryFromTerm()
-	readIndex := int(s.commitIndex.Load())
+
+	if s.logEntries[s.commitIndex].Term != s.currentTerm {
+		return errors.New("current committed index's term is not from this term, try later")
+	}
 
 	var serversReplied atomic.Int32
 
+	wg := sync.WaitGroup{}
+
 	feedbackHeartbeat := func(peer int) {
-		reply := s.sendHeartbeat(peer, false, nil)
+		defer wg.Done()
+
+		reply := s.sendHeartbeat(peer, false)
 		if reply.Success {
 			serversReplied.Add(1)
 		}
 	}
 
 	for _, peer := range s.peers {
+		wg.Add(1)
 		go feedbackHeartbeat(peer)
 	}
 
-	for int(serversReplied.Load()) < quorum {
-		// wait
+	wg.Wait()
+
+	if int(serversReplied.Load()) < quorum {
+		return errors.New("client query didn't reach quorum")
 	}
 
-	<-s.fsm.waitTill(readIndex)
-
 	reply.Status = OK
-
 	return nil
 }
 
-func (s *Server) waitUntilCommittedEntryFromTerm() chan struct{} {
-	out := make(chan struct{}, 1)
-	for s.logEntries[s.commitIndex.Load()].Term != int(s.currentTerm.Load()) {
-		time.Sleep(time.Millisecond * 100)
-	}
+func (s *Server) waitUntilCommittedEntryFromTerm() {
 
-	out <- struct{}{}
-	return out
+	return
 }
